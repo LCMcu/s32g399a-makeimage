@@ -2,9 +2,9 @@
 
 # 脚本名称：make_embedded_linux_image.sh
 # 描述：从配置文件读取镜像总大小、各子镜像的偏移、大小（以16进制字节表示）和存放位置信息，生成嵌入式Linux镜像。
-#       子镜像包括：BL2、FIP、Uboot、Kernel、DTB、ROOTFS、Work。
+#       子镜像包括：BL2、FIP、Kernel、DTB、ROOTFS、Work（UBOOT 已内置于 FIP，无需独立处理）。
 #       支持在指定偏移地址插入内容，覆盖原有数据（通过 CUSTOM_INSERTS）。
-#       未配置的区域填充为 0。
+#       在创建镜像时，先将整个镜像填充为 0x00，并自动扩展子镜像文件至定义大小。
 #       在生成镜像时计算子镜像的 CRC32 校验值，存储到 Image-Info 分区（通过 JFFS2 镜像）。
 #       额外计算 Image-Info 分区之前（0x0 - IMAGE_INFO_OFFSET）的整体 CRC32 值（ImageInfo_Before）。
 #       记录镜像制作时间（东八区）到 image_version 文件。
@@ -24,7 +24,7 @@
 #     CUSTOM_INSERTS=insert1:0x5000:/path/to/insert.bin:0x1000
 #   - 大小和偏移以16进制字节表示（以0x开头）
 #   - 子镜像文件路径和插入内容文件路径可以是绝对或相对路径
-# 使用方法：./make_embedded_linux_image.sh [-D|-R] <config_file>
+# 使用方法：./make_image.sh [-D|-R] <config_file>
 #   -D: Debug 版本
 #   -R: Release 版本
 # 输出文件夹：zk_s32g399a_YYYYMMDD_HHMMSS_{debug,release}/
@@ -74,7 +74,7 @@ source "$CONFIG_FILE"
 
 # 检查所需变量是否定义
 required_vars=("TOTAL_SIZE")
-sub_components=("BL2" "FIP" "UBOOT" "KERNEL" "DTB" "ROOTFS" "WORK")
+sub_components=("BL2" "FIP" "KERNEL" "DTB" "ROOTFS" "WORK")
 for comp in "${sub_components[@]}"; do
     required_vars+=("${comp}_OFFSET" "${comp}_SIZE" "${comp}_PATH")
 done
@@ -194,10 +194,24 @@ hex_to_dec() {
     echo $((16#${hex_value#0x}))
 }
 
-# 创建初始镜像文件（零填充到总大小）
+# 函数：扩展文件至指定大小
+pad_file_to_size() {
+    local file="$1"
+    local size_hex="$2"
+    local size_dec=$(hex_to_dec "$size_hex")
+    local current_size=$(wc -c < "$file")
+    if [ $current_size -lt $size_dec ]; then
+        echo "Padding $file from $current_size bytes to $size_hex ($size_dec bytes) with zeros"
+        dd if=/dev/zero of="$file.padded" bs=1 count=0 seek="$size_dec" status=progress
+        dd if="$file" of="$file.padded" conv=notrunc status=progress
+        mv "$file.padded" "$file"
+    fi
+}
+
+# 创建初始镜像文件（填充整个镜像为 0x00）
 total_size_dec=$(hex_to_dec "$TOTAL_SIZE")
-echo "Creating initial image file: $OUTPUT_IMAGE with size $TOTAL_SIZE ($total_size_dec bytes)"
-dd if=/dev/zero of="$OUTPUT_IMAGE" bs=1 count=0 seek="$total_size_dec" status=progress
+echo "Creating initial image file: $OUTPUT_IMAGE with size $TOTAL_SIZE ($total_size_dec bytes) filled with zeros"
+dd if=/dev/zero of="$OUTPUT_IMAGE" bs=1 count="$total_size_dec" status=progress
 if [ $? -ne 0 ]; then
     echo "Error: Failed to create initial image!"
     exit 1
@@ -215,11 +229,14 @@ write_sub_image() {
     local offset_dec=$(hex_to_dec "$offset_hex")
     local size_dec=$(hex_to_dec "$size_hex")
 
-    echo "Writing $sub_name from $file to offset $offset_hex ($offset_dec bytes) with size $size_hex ($size_dec bytes)"
-    dd if="$file" of="$OUTPUT_IMAGE" bs=1 seek="$offset_dec" count="$size_dec" conv=notrunc status=progress
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to write $sub_name!"
-        exit 1
+    if [ -n "$offset_hex" ] && [ -n "$size_hex" ] && [ -n "$file" ] && [ -f "$file" ]; then
+        pad_file_to_size "$file" "$size_hex"
+        echo "Writing $sub_name from $file to offset $offset_hex ($offset_dec bytes) with size $size_hex ($size_dec bytes)"
+        dd if="$file" of="$OUTPUT_IMAGE" bs=1 seek="$offset_dec" count="$size_dec" conv=notrunc status=progress
+        if [ $? -ne 0 ]; then
+            echo "Error: Failed to write $sub_name!"
+            exit 1
+        fi
     fi
 }
 
@@ -240,62 +257,6 @@ write_custom_insert() {
     fi
 }
 
-# 函数：填充未配置区域为 0
-fill_unallocated_regions() {
-    local total_size=$1
-    local regions=()
-
-    # 收集所有已配置的区域
-    for comp in "${sub_components[@]}"; do
-        offset_var="${comp}_OFFSET"
-        size_var="${comp}_SIZE"
-        offset_dec=$(hex_to_dec "${!offset_var}")
-        size_dec=$(hex_to_dec "${!size_var}")
-        regions+=("$offset_dec:$size_dec")
-    done
-
-    # 添加 CUSTOM_INSERTS 和 image_info.jffs2 的区域
-    if [ -n "$CUSTOM_INSERTS" ]; then
-        IFS=',' read -r -a inserts <<< "$CUSTOM_INSERTS"
-        for insert in "${inserts[@]}"; do
-            IFS=':' read -r name offset path size <<< "$insert"
-            offset_dec=$(hex_to_dec "$offset")
-            size_dec=$(hex_to_dec "$size")
-            regions+=("$offset_dec:$size_dec")
-        done
-    fi
-
-    # 按偏移量排序
-    IFS=$'\n' sorted_regions=($(for r in "${regions[@]}"; do echo "$r"; done | sort -n -t ':' -k 1))
-    
-    # 检查并填充未分配区域
-    local current_pos=0
-    for region in "${sorted_regions[@]}"; do
-        IFS=':' read -r offset size <<< "$region"
-        if [ $current_pos -lt $offset ]; then
-            local gap_size=$((offset - current_pos))
-            echo "Filling unallocated region from $current_pos to $offset ($gap_size bytes) with zeros"
-            dd if=/dev/zero of="$OUTPUT_IMAGE" bs=1 seek="$current_pos" count="$gap_size" conv=notrunc status=progress
-            if [ $? -ne 0 ]; then
-                echo "Error: Failed to fill unallocated region at $current_pos!"
-                exit 1
-            fi
-        fi
-        current_pos=$((offset + size))
-    done
-
-    # 检查镜像末尾是否需要填充
-    if [ $current_pos -lt $total_size ]; then
-        local gap_size=$((total_size - current_pos))
-        echo "Filling unallocated region from $current_pos to $total_size ($gap_size bytes) with zeros"
-        dd if=/dev/zero of="$OUTPUT_IMAGE" bs=1 seek="$current_pos" count="$gap_size" conv=notrunc status=progress
-        if [ $? -ne 0 ]; then
-            echo "Error: Failed to fill unallocated region at $current_pos!"
-            exit 1
-        fi
-    fi
-}
-
 # 依次写入子镜像
 for comp in "${sub_components[@]}"; do
     write_sub_image "$comp"
@@ -309,10 +270,6 @@ if [ -n "$CUSTOM_INSERTS" ]; then
         write_custom_insert "$name" "$offset" "$path" "$size"
     done
 fi
-
-# 填充未配置区域为 0
-echo "Filling unallocated regions with zeros..."
-fill_unallocated_regions "$total_size_dec"
 
 # 计算 Image-Info 分区之前的 CRC32（0x0 - IMAGE_INFO_OFFSET）
 image_info_offset_dec=$(hex_to_dec "$IMAGE_INFO_OFFSET")
