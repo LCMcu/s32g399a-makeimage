@@ -1,2 +1,3 @@
 *.image
 *.txt
+/zk_s32g*
